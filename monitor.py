@@ -21,7 +21,6 @@ PROFILE_DIR = Path("browser_profile")
 
 # ---------------------------------------------------------------------------
 # JS injected into each page to locate the container and extract card IDs.
-# Same robust descent + stable-ID logic as the Chrome extension (Project1).
 # ---------------------------------------------------------------------------
 EXTRACT_JS = r"""
 (keywords) => {
@@ -106,29 +105,74 @@ EXTRACT_JS = r"""
 # ---------------------------------------------------------------------------
 
 def load_config():
-    return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    if not CONFIG_FILE.exists():
+        sys.exit(f"[ERROR] Config file not found: {CONFIG_FILE.resolve()}\n"
+                 f"        Copy config.json.example to config.json and edit it.")
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        sys.exit(f"[ERROR] Invalid JSON in config.json: {e}")
+
+    # Validate ntfy topic.
+    topic = cfg.get("ntfy", {}).get("topic", "")
+    if not topic or "CHANGE-THIS" in topic:
+        sys.exit("[ERROR] Please set a unique ntfy topic in config.json.\n"
+                 "        Then subscribe at https://ntfy.sh/<your-topic> on Windows.")
+
+    # Validate time strings if alwaysOn is false.
+    tw = cfg.get("timeWindow", {})
+    if not tw.get("alwaysOn", False):
+        for key in ("from", "to"):
+            val = tw.get(key, "")
+            try:
+                h, m = map(int, val.split(":"))
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    raise ValueError
+            except (ValueError, AttributeError):
+                sys.exit(f"[ERROR] timeWindow.{key} is invalid: '{val}'. Use HH:MM format.")
+
+    # Validate site modes.
+    for i, site in enumerate(cfg.get("sites", [])):
+        mode = site.get("mode", "NEW")
+        if mode not in ("NEW", "ANY"):
+            sys.exit(f"[ERROR] sites[{i}].mode is '{mode}'. Must be 'NEW' or 'ANY'.")
+
+    return cfg
+
 
 def load_state():
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[WARN] Could not read state file ({e}). Starting fresh.")
     return {"seen": {}}
 
+
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        STATE_FILE.write_text(
+            json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as e:
+        print(f"[ERROR] Could not save state: {e}. Seen-jobs progress may be lost.")
+
 
 def is_within_window(tw):
-    if not tw or tw.get("alwaysOn", True):
+    # Default alwaysOn to False so from/to are respected when provided.
+    if not tw or tw.get("alwaysOn", False):
         return True
-    now = datetime.now()
+    now     = datetime.now()
     now_min = now.hour * 60 + now.minute
     def to_min(s):
         h, m = map(int, s.split(":"))
         return h * 60 + m
     f = to_min(tw.get("from", "00:00"))
-    t = to_min(tw.get("to", "23:59"))
+    t = to_min(tw.get("to",   "23:59"))
     if f <= t:
         return f <= now_min <= t
-    return now_min >= f or now_min <= t    # overnight
+    return now_min >= f or now_min <= t     # overnight window
+
 
 def short_url(url):
     try:
@@ -139,26 +183,36 @@ def short_url(url):
 
 
 # ---------------------------------------------------------------------------
-# ntfy notification
+# ntfy notification (shared client, response status checked)
 # ---------------------------------------------------------------------------
 
+_http_client: httpx.AsyncClient | None = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=10)
+    return _http_client
+
 async def notify(cfg, title, message, priority=3):
-    ntfy = cfg.get("ntfy", {})
+    ntfy  = cfg.get("ntfy", {})
     base  = ntfy.get("url", "https://ntfy.sh").rstrip("/")
-    topic = ntfy.get("topic", "job-monitor")
+    topic = ntfy.get("topic", "CHANGE-THIS-TOPIC")
     headers = {
         "Title":    title,
         "Priority": str(priority),
         "Tags":     "briefcase",
     }
+    ts = datetime.now().strftime("%H:%M:%S")
     try:
-        async with httpx.AsyncClient() as client:
-            await client.post(f"{base}/{topic}", content=message.encode(),
-                              headers=headers, timeout=10)
-        ts = datetime.now().strftime("%H:%M:%S")
+        client = await get_http_client()
+        r = await client.post(f"{base}/{topic}", content=message.encode(), headers=headers)
+        r.raise_for_status()
         print(f"[{ts}] NOTIFY  {title}: {message}")
+    except httpx.HTTPStatusError as e:
+        print(f"[{ts}] NOTIFY FAILED (HTTP {e.response.status_code}): {e}")
     except Exception as e:
-        print(f"[NOTIFY ERROR] {e}")
+        print(f"[{ts}] NOTIFY ERROR: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -174,26 +228,28 @@ async def activate_tab(page, tab_cfg):
     if not target_text:
         return
     try:
-        # Wait a moment for tabs to render in SPAs.
         await page.wait_for_selector(selector, timeout=8000)
         tab_els = await page.query_selector_all(selector)
         for el in tab_els:
             label = (await el.inner_text()).strip().lower()
             if target_text in label:
                 await el.click()
+                # Wait for content to settle after tab switch.
                 try:
                     await page.wait_for_load_state("networkidle", timeout=6000)
                 except PWTimeout:
-                    await asyncio.sleep(1.5)
-                print(f"  [TAB] Activated: {await el.inner_text()}")
+                    await asyncio.sleep(1)
+                print(f"  [TAB] Activated: {(await el.inner_text()).strip()}")
                 return
         print(f"  [TAB] WARNING: tab matching '{target_text}' not found.")
+    except PWTimeout:
+        print(f"  [TAB] Timed out waiting for tab selector '{selector}'.")
     except Exception as e:
-        print(f"  [TAB] Error activating tab: {e}")
+        print(f"  [TAB] Error: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Core scan
+# Core scan (one site, one page)
 # ---------------------------------------------------------------------------
 
 async def scan_site(page, site, state, cfg):
@@ -201,21 +257,35 @@ async def scan_site(page, site, state, cfg):
     keywords = site.get("containerClassKeywords", "")
     mode     = site.get("mode", "NEW")
     tab_cfg  = site.get("targetTab")
-    # State key includes name so two sites at same URL stay separate.
+    # Key includes name so two sites at same URL stay separate.
     site_key = f"{url}::{site.get('name', url)}"
+
+    # Reset page to blank first so a previous failed navigation doesn't bleed through.
+    try:
+        await page.goto("about:blank", timeout=5000)
+    except Exception:
+        pass
 
     print(f"  Navigating to {short_url(url)} ...")
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        await asyncio.sleep(2)          # let SPA hydrate
+        # Wait for main content to be present rather than fixed sleep.
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except PWTimeout:
+        print("  [WARN] networkidle timed out — continuing with current DOM state.")
     except Exception as e:
         await notify(cfg, "Page load failed", f"{short_url(url)}: {e}")
         return
 
-    # Click the correct in-page tab if configured.
     await activate_tab(page, tab_cfg)
     if tab_cfg:
-        await asyncio.sleep(1)          # settle after tab switch
+        # Wait for list container to appear after tab click rather than fixed sleep.
+        if keywords.strip():
+            kw = keywords.strip().split()[0]
+            try:
+                await page.wait_for_selector(f"[class*='{kw}']", timeout=5000)
+            except PWTimeout:
+                pass
 
     if not keywords.strip():
         print("  [SKIP] No containerClassKeywords configured.")
@@ -250,18 +320,24 @@ async def scan_site(page, site, state, cfg):
         return
 
     # NEW mode — identity diff.
-    seen    = state.setdefault("seen", {}).setdefault(site_key, {})
-    new_ids = [i for i in ids if i and i not in seen]
+    # Reload state from disk each cycle so external edits (e.g. manual baseline reset) take effect.
+    fresh_state  = load_state()
+    seen         = fresh_state.setdefault("seen", {}).setdefault(site_key, {})
+    new_ids      = [i for i in ids if i and i not in seen]
 
     now_ts = int(time.time())
     for i in ids:
         if i:
             seen[i] = now_ts
+
     # Trim oldest beyond 1000 per site.
     if len(seen) > 1000:
         oldest = sorted(seen, key=seen.__getitem__)[:len(seen) - 1000]
         for k in oldest:
             del seen[k]
+
+    # Propagate changes back to the in-memory state dict and persist.
+    state["seen"] = fresh_state["seen"]
     save_state(state)
 
     if new_ids:
@@ -281,11 +357,14 @@ async def run():
     cfg      = load_config()
     state    = load_state()
     sites    = cfg.get("sites", [])
-    interval = max(1, cfg.get("interval", 5)) * 60
+    interval = max(1, int(cfg.get("interval", 5)))
     headless = cfg.get("headless", False)
 
-    print(f"Job Monitor — interval={cfg.get('interval',5)}min  sites={len(sites)}")
-    print(f"ntfy topic : {cfg.get('ntfy', {}).get('topic', '(not set)')}")
+    if int(cfg.get("interval", 5)) < 1:
+        print("[WARN] Interval below 1 minute is not supported. Using 1 minute.")
+
+    print(f"Job Monitor — interval={interval}min  sites={len(sites)}")
+    print(f"ntfy topic : {cfg.get('ntfy', {}).get('topic')}")
     print(f"Profile dir: {PROFILE_DIR.resolve()}")
     if not headless:
         print("Browser is VISIBLE — log in if needed, then leave it open.")
@@ -293,30 +372,37 @@ async def run():
     PROFILE_DIR.mkdir(exist_ok=True)
 
     async with async_playwright() as p:
-        ctx = await p.chromium.launch_persistent_context(
+        ctx  = await p.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
             headless=headless,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        # Always use a fresh page to avoid inheriting state from the profile's last session.
+        page = await ctx.new_page()
 
         try:
             while True:
                 if not is_within_window(cfg.get("timeWindow")):
-                    print(f"[{datetime.now().strftime('%H:%M')}] Outside time window — sleeping.")
+                    ts = datetime.now().strftime("%H:%M")
+                    print(f"[{ts}] Outside time window — sleeping {interval}min.")
                 else:
                     for site in sites:
                         if not site.get("url"):
                             continue
-                        print(f"\n[SCAN] {site.get('name', site['url'])}")
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        print(f"\n[{ts}] SCAN: {site.get('name', site['url'])}")
                         try:
                             await scan_site(page, site, state, cfg)
                         except Exception as e:
-                            print(f"  [ERROR] {e}")
-                await asyncio.sleep(interval)
+                            print(f"  [ERROR] Unexpected: {e}")
+
+                await asyncio.sleep(interval * 60)
+
         except (asyncio.CancelledError, KeyboardInterrupt):
             print("\nShutting down.")
         finally:
+            if _http_client and not _http_client.is_closed:
+                await _http_client.aclose()
             await ctx.close()
 
 
