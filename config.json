@@ -1,14 +1,12 @@
 {
-  "_comment": "Change ntfy.topic to something unique. Subscribe at https://ntfy.sh/<topic> on your Windows machine.",
   "ntfy": {
+    "_comment": "Pick a unique topic name. Subscribe at https://ntfy.sh/<topic> on your Windows machine.",
     "url": "https://ntfy.sh",
-    "topic": "my-job-monitor-CHANGE-THIS"
+    "topic": "CHANGE-THIS-to-something-unique"
   },
   "interval": 5,
   "headless": false,
   "timeWindow": {
-    "from": "09:00",
-    "to": "18:00",
     "alwaysOn": true
   },
   "sites": [
@@ -19,7 +17,8 @@
         "selector": "[role='tab']",
         "text": "Available Tasks"
       },
-      "containerClassKeywords": "style__task-list__XXXXX",
+      "containerClassKeywords": "",
+      "_comment_keywords": "Run probe.py to find the right class names, then fill in above.",
       "mode": "NEW"
     }
   ]
